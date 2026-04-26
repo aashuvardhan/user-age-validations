@@ -39,7 +39,7 @@ novelty_2/
 | Phase | What happens |
 |---|---|
 | **Phase 1** — FedAvg | Standard federated training across all clients (`train_normal`). Global model + per-epoch param-change CSV saved. |
-| **Phase 1.5** — Distillation *(optional)* | Dataset distillation via Feature Distribution Matching (MMD). Each client's data compressed to `ipc` synthetic images per class and saved to `distilled_data/`. Enabled with `--distill_data`. |
+| **Phase 1.5** — Distillation ⭐ **Novelty** | Dataset distillation via Feature Distribution Matching (MMD). Each client's data compressed to `ipc` synthetic images per class and saved to `distilled_data/`. Enabled with `--distill_data`. |
 | **Phase 2** — Unlearning | FIM computed on clean vs. forget-target data. Layers with sensitivity score above the `fim_percentile`-th percentile receive a LoRA adapter (`DynamicLora`). Only adapter weights are trained — base model stays frozen. |
 | **Post-unlearning** | Membership Inference Attack (MIA) evaluation; optional relearning resistance test; restored Phase 1 model verification. |
 
@@ -50,6 +50,43 @@ novelty_2/
 | `client` | Whole clients | Erases all knowledge contributed by specified clients (default mode). |
 | `class` | Class labels | Relabels the forget class to random other classes before unlearning. |
 | `sample` | Backdoor samples | Removes a backdoor trigger implanted in early batches of forget-clients. |
+
+---
+
+## Phase 1.5 — Feature Distribution Matching (Dataset Distillation)
+
+![Feature Distribution Matching pipeline](img_2.png)
+
+> ⭐ **Novelty** — Phase 1.5 is a novel contribution of this work. It runs between standard FedAvg (Phase 1) and LoRA-based unlearning (Phase 2), compressing each client's real dataset into a tiny set of **synthetic images** whose deep-feature embeddings match the real data's class-wise distribution. These synthetic images are then used as a fast, compact substitute during Phase 2 training.
+
+Enable it by passing `--distill_data` to `main.py`.
+
+### How it works (step by step)
+
+| Step | What happens |
+|---|---|
+| **1. Phase 1 completed** | The global model is fully trained via FedAvg across all clients. Its weights are frozen for the rest of Phase 1.5. |
+| **2. Strip the classifier head** | A `FeatureExtractor` wraps the trained model and replaces the final fully-connected layer with `nn.Identity()`, turning the model into a fixed embedding function (`torch.no_grad()`). |
+| **3. Compute real mean embeddings** | Real images from each client are passed through the frozen extractor, L2-normalised, and averaged per class → **mean embedding** `μ_real(c)`. |
+| **4. Initialise synthetic images** | For each class `c`, `ipc` synthetic images are initialised as small random noise in the same normalised pixel space as the real data (bounds derived from dataset mean/std). These pixels carry `requires_grad=True`. |
+| **5. MMD optimisation loop** | An Adam optimiser updates **only the pixel values** of the synthetic images for `dm_iterations` steps. The loss is the squared Mean Feature Discrepancy (MMD): `L = Σ_c ‖μ_real(c) − μ_syn(c)‖² / n_classes`. Model weights never change. |
+| **6. Save & hand off** | Distilled tensors `(syn_images, syn_labels)` are saved to `distilled_data/client_<id>.pt`. Phase 2 loads these files instead of real client data, dramatically reducing training time. |
+
+### Key design choices
+
+- **Pixel-space optimisation, not model training** — gradients flow to pixels, not weights. The model backbone remains frozen throughout.
+- **L2 normalisation before MMD** — embeddings are unit-normalised before computing means, making the loss scale-invariant and convergence reliable across datasets.
+- **Class-balanced loss** — the total loss is averaged over the number of classes present for each client, ensuring balanced contribution even when class counts vary across clients.
+- **Normalised pixel clamping** — synthetic pixels are clamped to the same `[(0−μ)/σ, (1−μ)/σ]` range as real normalised images after every optimisation step, so the feature extractor always sees a valid input range.
+- **Per-client `.pt` files** — each client's distilled data is stored independently, allowing selective loading for forget vs. retain clients during Phase 2.
+
+### Relevant arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--distill_data` | `False` | Enable Phase 1.5 distillation |
+| `--ipc` | `5` | Synthetic images **per class** per client |
+| `--dm_iterations` | `500` | Pixel optimisation steps per client |
 
 ---
 
@@ -106,7 +143,8 @@ python main.py \
   --paradigm fused \
   --global_epoch 100 \
   --local_epoch 5 \
-  --alpha 1.0
+  --alpha 1.0 \
+  --forget_client_idx 3 9 13 19 23 29 33 39 43
 ```
 
 ### Client unlearning — CIFAR-10 (9 forget clients)
